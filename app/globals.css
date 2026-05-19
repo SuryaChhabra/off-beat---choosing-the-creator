@@ -1,26 +1,125 @@
 @import "tailwindcss";
 
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --bg: #0a0a0a;
+  --bg-elev: #141414;
+  --border: #2a2a2a;
+  --border-faint: #1f1f1f;
+  --fg: #f5f5f5;
+  --fg-muted: #a5a5a8;
+  --fg-dim: #b5b5b8;
+  --fg-faint: #555;
+  --pink: #ff2d8f;
 }
 
 @theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+  --color-bg: var(--bg);
+  --color-bg-elev: var(--bg-elev);
+  --color-border: var(--border);
+  --color-border-faint: var(--border-faint);
+  --color-fg: var(--fg);
+  --color-fg-muted: var(--fg-muted);
+  --color-fg-dim: var(--fg-dim);
+  --color-fg-faint: var(--fg-faint);
+  --color-pink: var(--pink);
+  --font-sans: var(--font-inter), ui-sans-serif, system-ui, sans-serif;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
-}
-
+html,
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font-sans);
+  font-weight: 500;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  font-weight: 500;
+}
+
+button,
+input {
+  font-family: inherit;
+  font-weight: 500;
+}
+
+input:focus {
+  outline: none;
+  border-color: var(--pink);
+}
+
+::selection {
+  background: var(--pink);
+  color: var(--bg);
+}
+
+.off-headline {
+  font-size: 56px;
+  letter-spacing: -0.04em;
+}
+
+.off-input-row {
+  display: flex;
+  gap: 8px;
+  align-items: stretch;
+  margin-bottom: 3rem;
+  max-width: 540px;
+}
+
+.off-input {
+  flex: 1;
+  background: var(--bg-elev);
+  border: 0.5px solid var(--border);
+  border-radius: 8px;
+  padding: 13px 16px;
+  font-size: 14px;
+  color: var(--fg);
+  min-width: 0;
+}
+
+.off-input::placeholder {
+  color: var(--fg-faint);
+}
+
+.off-input:disabled {
+  opacity: 0.6;
+}
+
+.off-button {
+  background: var(--pink);
+  color: var(--bg);
+  border: 0;
+  padding: 13px 24px;
+  border-radius: 8px;
+  font-size: 14px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: opacity 0.15s;
+}
+
+.off-button:hover {
+  opacity: 0.9;
+}
+
+.off-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+@media (max-width: 640px) {
+  main.min-h-screen {
+    padding: 2.5rem 1.25rem 2.5rem !important;
+  }
+  .off-headline {
+    font-size: 36px !important;
+  }
+  .off-input-row {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .off-phase-row {
+    gap: 0.75rem !important;
+  }
 }

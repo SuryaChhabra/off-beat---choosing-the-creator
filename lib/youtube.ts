@@ -4,6 +4,13 @@
 
 import { google, youtube_v3 } from "googleapis";
 
+export type RecentVideo = {
+  videoId: string;
+  title: string;
+  description: string;
+  publishedAt: string;
+};
+
 export type ChannelSearchResult = {
   channelId: string;
   title: string;
@@ -73,6 +80,68 @@ export async function searchChannels(
 
     console.log(`[YouTube] searchChannels returned ${results.length} in ${Date.now() - startedAt}ms`);
     return results;
+  } catch (err) {
+    if (isQuotaExceeded(err)) throw new Error("YouTube API quota exceeded for the day");
+    throw err;
+  }
+}
+
+// Resolves any user input — @handle, channel URL, plain creator name — to a single
+// channel via YouTube search. Returns null if nothing plausible was found.
+export async function findChannel(query: string): Promise<ChannelSearchResult | null> {
+  const cleaned = query.trim();
+  if (!cleaned) return null;
+
+  // Strip URL prefixes + leading @ so search treats "@therebelkid" and
+  // "https://youtube.com/@therebelkid" the same as "therebelkid".
+  const stripped = cleaned
+    .replace(/^https?:\/\/(www\.)?youtube\.com\//i, "")
+    .replace(/^\/+/, "")
+    .replace(/^@/, "")
+    .replace(/^c\//, "")
+    .replace(/^channel\//, "")
+    .replace(/^user\//, "")
+    .split(/[/?#]/)[0]
+    .trim();
+
+  const searchTerm = stripped || cleaned;
+  const results = await searchChannels(searchTerm, 5);
+  return results[0] ?? null;
+}
+
+export async function getRecentVideos(
+  channelId: string,
+  maxResults: number = 15,
+): Promise<RecentVideo[]> {
+  const yt = getClient();
+  const startedAt = Date.now();
+  console.log(`[YouTube] getRecentVideos channelId="${channelId}" max=${maxResults}`);
+
+  try {
+    const res = await yt.search.list({
+      part: ["snippet"],
+      channelId,
+      type: ["video"],
+      order: "date",
+      maxResults,
+    });
+
+    const items = res.data.items ?? [];
+    const videos: RecentVideo[] = items
+      .map((item) => {
+        const videoId = item.id?.videoId;
+        if (!videoId) return null;
+        return {
+          videoId,
+          title: item.snippet?.title ?? "",
+          description: item.snippet?.description ?? "",
+          publishedAt: item.snippet?.publishedAt ?? "",
+        } satisfies RecentVideo;
+      })
+      .filter((x): x is RecentVideo => x !== null);
+
+    console.log(`[YouTube] getRecentVideos returned ${videos.length} in ${Date.now() - startedAt}ms`);
+    return videos;
   } catch (err) {
     if (isQuotaExceeded(err)) throw new Error("YouTube API quota exceeded for the day");
     throw err;
