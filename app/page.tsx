@@ -42,7 +42,7 @@ export default function Home() {
             margin: "0 0 2rem",
           }}
         >
-          What should this creator{" "}
+          What should this YouTube creator{" "}
           <span style={{ color: "var(--pink)" }}>actually</span> build?
         </h1>
 
@@ -55,9 +55,9 @@ export default function Home() {
             maxWidth: 560,
           }}
         >
-          Drop in any creator. We map their audience, score the categories their
-          audience actually buys, and surface brand concepts grounded in
-          evidence — not vibes.
+          Drop in any YouTube creator. We map their audience, score the
+          categories their audience actually buys, and surface brand concepts
+          grounded in evidence — not vibes.
         </p>
 
         <AnalyzePanel />
