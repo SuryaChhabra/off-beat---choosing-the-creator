@@ -10,6 +10,7 @@ import { useCompletion } from "@ai-sdk/react";
 import Image from "next/image";
 import Link from "next/link";
 import { useEffect, useMemo, useRef, useState } from "react";
+import { RefinementChat } from "./RefinementChat";
 
 const META_START = "__OFFBEAT_META_START__";
 const META_END = "__OFFBEAT_META_END__";
@@ -182,6 +183,11 @@ export function ResultsView({ handle }: { handle: string }) {
   const comments = findSection(sections, "Comment Culture");
   const themes = findSection(sections, "Content Themes");
 
+  // Refinement chat — slide-in panel keyed per concept so each chat is fresh.
+  const [discussingIdx, setDiscussingIdx] = useState<number | null>(null);
+  const activeConcept =
+    discussingIdx !== null && concepts ? concepts[discussingIdx] : null;
+
   return (
     <main className="results-root">
       <header className="results-topbar">
@@ -207,8 +213,21 @@ export function ResultsView({ handle }: { handle: string }) {
           error={conceptsError}
           profileDone={!isLoading && Boolean(meta) && Boolean(analysis.trim())}
           creatorTitle={meta?.title ?? ""}
+          onDiscuss={(i) => setDiscussingIdx(i)}
         />
       </div>
+
+      {activeConcept && meta && (
+        <RefinementChat
+          key={discussingIdx ?? "none"}
+          open={discussingIdx !== null}
+          onClose={() => setDiscussingIdx(null)}
+          creatorTitle={meta.title}
+          country={meta.country}
+          creatorProfile={analysis}
+          concept={activeConcept}
+        />
+      )}
     </main>
   );
 }
@@ -360,12 +379,14 @@ function ConceptsBlock({
   error,
   profileDone,
   creatorTitle,
+  onDiscuss,
 }: {
   concepts: BrandConcept[] | null;
   loading: boolean;
   error: string | null;
   profileDone: boolean;
   creatorTitle: string;
+  onDiscuss: (index: number) => void;
 }) {
   return (
     <section className="results-section results-section-final">
@@ -386,7 +407,12 @@ function ConceptsBlock({
       {concepts && concepts.length > 0 && (
         <div className="results-concept-grid">
           {concepts.map((c, i) => (
-            <ConceptCard key={i} concept={c} creatorTitle={creatorTitle} />
+            <ConceptCard
+              key={i}
+              concept={c}
+              creatorTitle={creatorTitle}
+              onDiscuss={() => onDiscuss(i)}
+            />
           ))}
         </div>
       )}
@@ -394,7 +420,15 @@ function ConceptsBlock({
   );
 }
 
-function ConceptCard({ concept, creatorTitle }: { concept: BrandConcept; creatorTitle: string }) {
+function ConceptCard({
+  concept,
+  creatorTitle,
+  onDiscuss,
+}: {
+  concept: BrandConcept;
+  creatorTitle: string;
+  onDiscuss: () => void;
+}) {
   return (
     <article className="results-concept-card">
       <span className="results-tier-badge">{concept.riskTier}</span>
@@ -414,6 +448,10 @@ function ConceptCard({ concept, creatorTitle }: { concept: BrandConcept; creator
         label={`Why ${creatorTitle || "this creator"} wins it`}
         value={concept.whyThisCreatorWins}
       />
+
+      <button type="button" onClick={onDiscuss} className="results-concept-discuss">
+        Discuss this →
+      </button>
     </article>
   );
 }
