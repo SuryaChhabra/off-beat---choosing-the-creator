@@ -52,26 +52,22 @@ export function SponsorScorecard({
 }
 
 function ScorecardBody({ rows }: { rows: SponsorRow[] }) {
-  const mainRows = rows.filter((r) => !r.affiliate && r.brand !== "Unknown");
-  const affiliateRows = rows.filter((r) => r.affiliate && r.brand !== "Unknown");
+  // Every named brand (sponsored or affiliate) renders in the main table.
+  // Affiliate-only rows get an "AFF" chip next to the brand name so the
+  // relationship type is still readable. "Unknown" rows aren't named brands,
+  // so they're collapsed into a single count footnote below the table.
+  const namedRows = rows.filter((r) => r.brand !== "Unknown");
   const unknownRows = rows.filter((r) => r.brand === "Unknown");
   const unknownTotal = unknownRows.reduce((s, r) => s + r.integrationsRecent, 0);
 
   return (
     <>
-      {mainRows.length > 0 ? (
-        <ScorecardTable rows={mainRows} />
+      {namedRows.length > 0 ? (
+        <ScorecardTable rows={namedRows} />
       ) : (
         <p className="results-section-status">
-          No named sponsors detected in the last 18 months.
+          No named brands detected in the last 18 months.
         </p>
-      )}
-
-      {affiliateRows.length > 0 && (
-        <div className="scorecard-subsection">
-          <h3 className="scorecard-subhead">Affiliate relationships (not sponsored)</h3>
-          <ScorecardTable rows={affiliateRows} />
-        </div>
       )}
 
       {unknownTotal > 0 && (
@@ -109,7 +105,10 @@ function ScorecardTable({ rows }: { rows: SponsorRow[] }) {
           <tbody>
             {rows.map((r) => (
               <tr key={r.brand}>
-                <td className="scorecard-brand">{r.brand}</td>
+                <td className="scorecard-brand">
+                  {r.brand}
+                  {r.affiliate && <span className="scorecard-brand-aff">AFF</span>}
+                </td>
                 <td>
                   <FormatBadge contentType={r.contentType} />
                 </td>
@@ -142,7 +141,10 @@ function ScorecardTable({ rows }: { rows: SponsorRow[] }) {
         {rows.map((r) => (
           <article key={r.brand} className="scorecard-card">
             <div className="scorecard-card-top">
-              <p className="scorecard-card-brand">{r.brand}</p>
+              <p className="scorecard-card-brand">
+                {r.brand}
+                {r.affiliate && <span className="scorecard-brand-aff">AFF</span>}
+              </p>
               <SignalBadge signal={r.signal} />
             </div>
             <div className="scorecard-card-row">

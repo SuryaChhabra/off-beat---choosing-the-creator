@@ -230,6 +230,14 @@ const TIER_RANK: Record<SponsorSignal, number> = {
 
 // ---------------------------------------------------------------------------
 // Haiku calls
+//
+// Every call below pins temperature: 0. Re-running the same channel against
+// the same 18-month window should produce the same brand list, the same
+// canonical mapping, and the same sentiment classifications. (Anthropic's
+// API isn't bit-for-bit reproducible at T=0, but it's the deterministic
+// setting and is what we contract for here. If you see drift, the cause is
+// almost certainly upstream — videos newly published into the window, or a
+// stale cache miss — not random sampling.)
 // ---------------------------------------------------------------------------
 
 async function extractSponsor(
@@ -247,16 +255,22 @@ async function extractSponsor(
   // let the Haiku call try to find a brand name; if it can't, we fall back to
   // "Unknown" below.
   if (!video.description || video.description.trim().length < 5) {
-    if (!video.paidProductPlacement) return empty;
-    return {
+    if (!video.paidProductPlacement) {
+      logExtraction(video, empty, "empty-description");
+      return empty;
+    }
+    const result: RawExtraction = {
       sponsored: true,
       brands: [],
       affiliate: false,
       evidence: "YouTube paidProductPlacement flag set; description empty.",
     };
+    logExtraction(video, result, "ppp-no-description");
+    return result;
   }
 
   try {
+    // temperature: 0 — see the comment on the section header above.
     const { text } = await complete({
       model: HAIKU_MODEL,
       system: SPONSOR_EXTRACTION_PROMPT,
@@ -276,18 +290,42 @@ async function extractSponsor(
     const cleaned = stripJsonFence(text);
     const parsed: unknown = JSON.parse(cleaned);
     if (!isExtraction(parsed)) {
-      console.warn("[sponsors] extraction shape mismatch:", parsed);
-      return video.paidProductPlacement
+      console.warn(`[sponsors] extraction shape mismatch for ${video.videoId}:`, parsed);
+      const fallback: RawExtraction = video.paidProductPlacement
         ? { sponsored: true, brands: [], affiliate: false, evidence: "Malformed model output, PPP flag set." }
         : empty;
+      logExtraction(video, fallback, "shape-mismatch");
+      return fallback;
     }
+    logExtraction(video, parsed, "haiku");
     return parsed;
   } catch (err) {
-    console.warn("[sponsors] extraction failed:", err);
-    return video.paidProductPlacement
+    console.warn(`[sponsors] extraction failed for ${video.videoId}:`, err);
+    const fallback: RawExtraction = video.paidProductPlacement
       ? { sponsored: true, brands: [], affiliate: false, evidence: "Extraction failed, PPP flag set." }
       : empty;
+    logExtraction(video, fallback, "haiku-failed");
+    return fallback;
   }
+}
+
+// Single line per video so the server console can be `grep '\[sponsors\] video='`-ed
+// to confirm what Haiku saw vs. what made it into the scorecard. Logs every video
+// the pipeline touches — sponsored, affiliate, neither.
+function logExtraction(
+  video: DetailedVideo,
+  result: RawExtraction,
+  source: string,
+): void {
+  const date = video.publishedAt.slice(0, 10) || "????-??-??";
+  const brands = result.brands.length > 0 ? `[${result.brands.join(", ")}]` : "[]";
+  const evidence = result.evidence
+    ? ` evidence="${result.evidence.replace(/\s+/g, " ").slice(0, 120)}"`
+    : "";
+  console.log(
+    `[sponsors] video=${video.videoId} date=${date} sponsored=${result.sponsored} ` +
+      `affiliate=${result.affiliate} brands=${brands} src=${source}${evidence}`,
+  );
 }
 
 async function normalizeBrands(rawBrands: string[]): Promise<Record<string, string>> {
