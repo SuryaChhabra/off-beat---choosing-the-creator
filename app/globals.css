@@ -77,11 +77,6 @@ input:focus {
   }
 }
 
-.off-headline {
-  font-size: 56px;
-  letter-spacing: -0.04em;
-}
-
 .off-input-row {
   display: flex;
   gap: 8px;
@@ -131,12 +126,6 @@ input:focus {
 }
 
 @media (max-width: 640px) {
-  main.min-h-screen {
-    padding: 2.5rem 1.25rem 2.5rem !important;
-  }
-  .off-headline {
-    font-size: 36px !important;
-  }
   .off-input-row {
     flex-direction: column;
     align-items: stretch;

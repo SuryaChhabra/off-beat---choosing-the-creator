@@ -4,12 +4,10 @@ export default function Home() {
   return (
     <main
       className="min-h-screen w-full"
-      style={{
-        background: "var(--bg)",
-        padding: "4rem 2.5rem 3.5rem",
-      }}
+      style={{ background: "var(--bg)" }}
     >
-      <div style={{ marginBottom: "5rem" }}>
+      {/* Brand mark — anchored top-left, deliberately outside the centered column. */}
+      <div className="px-6 md:px-10 pt-12 md:pt-16">
         <span
           style={{
             color: "var(--pink)",
@@ -23,12 +21,13 @@ export default function Home() {
         </span>
       </div>
 
-      <div style={{ maxWidth: 580 }}>
+      {/* Centered content column. */}
+      <div className="max-w-4xl mx-auto px-8 py-20 md:py-32">
         <p
           style={{
             fontSize: 12,
             color: "var(--pink)",
-            margin: "0 0 1.25rem",
+            margin: "0 0 1.5rem",
             letterSpacing: "0.18em",
             textTransform: "uppercase",
           }}
@@ -37,12 +36,10 @@ export default function Home() {
         </p>
 
         <h1
-          className="off-headline"
+          className="text-7xl md:text-8xl lg:text-9xl leading-[0.95] tracking-[-0.04em]"
           style={{
             color: "var(--fg)",
-            lineHeight: 0.96,
-            margin: "0 0 1.5rem",
-            letterSpacing: "-0.04em",
+            margin: "0 0 2rem",
           }}
         >
           What should this creator{" "}
@@ -51,11 +48,11 @@ export default function Home() {
 
         <p
           style={{
-            fontSize: 16,
+            fontSize: 18,
             color: "var(--fg-muted)",
             lineHeight: 1.55,
-            margin: "0 0 2.5rem",
-            maxWidth: 460,
+            margin: "0 0 3rem",
+            maxWidth: 560,
           }}
         >
           Drop in any creator. We map their audience, score the categories their
