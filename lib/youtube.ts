@@ -186,3 +186,143 @@ export async function getChannelDetails(channelId: string): Promise<ChannelDetai
     throw err;
   }
 }
+
+// ---------------------------------------------------------------------------
+// Sponsor scorecard support: uploads playlist → video details → comments.
+// These are deliberately separate from getRecentVideos (which uses search and
+// gives the streamed Profile its evidence base). The scorecard pipeline needs
+// stats (viewCount) and pages well past the most recent 15.
+// ---------------------------------------------------------------------------
+
+export type DetailedVideo = {
+  videoId: string;
+  title: string;
+  description: string;
+  publishedAt: string;
+  viewCount: number;
+};
+
+export async function getUploadsPlaylistId(channelId: string): Promise<string | null> {
+  const yt = getClient();
+  const startedAt = Date.now();
+  try {
+    const res = await yt.channels.list({
+      part: ["contentDetails"],
+      id: [channelId],
+    });
+    const uploads = res.data.items?.[0]?.contentDetails?.relatedPlaylists?.uploads ?? null;
+    console.log(
+      `[YouTube] getUploadsPlaylistId channelId="${channelId}" → ${uploads ?? "null"} in ${Date.now() - startedAt}ms`,
+    );
+    return uploads;
+  } catch (err) {
+    if (isQuotaExceeded(err)) throw new Error("YouTube API quota exceeded for the day");
+    throw err;
+  }
+}
+
+export async function getPlaylistVideoIds(
+  playlistId: string,
+  max: number = 50,
+): Promise<{ videoId: string; publishedAt: string }[]> {
+  const yt = getClient();
+  const startedAt = Date.now();
+  const results: { videoId: string; publishedAt: string }[] = [];
+  let pageToken: string | undefined = undefined;
+
+  try {
+    while (results.length < max) {
+      const remaining = max - results.length;
+      const pageSize = Math.min(50, remaining);
+      const res: youtube_v3.Schema$PlaylistItemListResponse = (
+        await yt.playlistItems.list({
+          part: ["contentDetails"],
+          playlistId,
+          maxResults: pageSize,
+          pageToken,
+        })
+      ).data;
+      for (const item of res.items ?? []) {
+        const vid = item.contentDetails?.videoId;
+        const published = item.contentDetails?.videoPublishedAt;
+        if (vid && published) results.push({ videoId: vid, publishedAt: published });
+      }
+      pageToken = res.nextPageToken ?? undefined;
+      if (!pageToken) break;
+    }
+    console.log(
+      `[YouTube] getPlaylistVideoIds playlist=${playlistId} returned ${results.length} in ${Date.now() - startedAt}ms`,
+    );
+    return results.slice(0, max);
+  } catch (err) {
+    if (isQuotaExceeded(err)) throw new Error("YouTube API quota exceeded for the day");
+    throw err;
+  }
+}
+
+export async function getVideoDetails(videoIds: string[]): Promise<DetailedVideo[]> {
+  if (videoIds.length === 0) return [];
+  const yt = getClient();
+  const startedAt = Date.now();
+  const results: DetailedVideo[] = [];
+
+  try {
+    for (let i = 0; i < videoIds.length; i += 50) {
+      const chunk = videoIds.slice(i, i + 50);
+      const res = await yt.videos.list({
+        part: ["snippet", "statistics"],
+        id: chunk,
+      });
+      for (const item of res.data.items ?? []) {
+        results.push({
+          videoId: item.id ?? "",
+          title: item.snippet?.title ?? "",
+          description: item.snippet?.description ?? "",
+          publishedAt: item.snippet?.publishedAt ?? "",
+          viewCount: Number(item.statistics?.viewCount ?? 0),
+        });
+      }
+    }
+    console.log(
+      `[YouTube] getVideoDetails returned ${results.length}/${videoIds.length} in ${Date.now() - startedAt}ms`,
+    );
+    return results;
+  } catch (err) {
+    if (isQuotaExceeded(err)) throw new Error("YouTube API quota exceeded for the day");
+    throw err;
+  }
+}
+
+export async function getVideoComments(
+  videoId: string,
+  max: number = 50,
+): Promise<string[]> {
+  const yt = getClient();
+  const startedAt = Date.now();
+  try {
+    const res = await yt.commentThreads.list({
+      part: ["snippet"],
+      videoId,
+      maxResults: Math.min(max, 100),
+      order: "relevance",
+    });
+    const comments = (res.data.items ?? [])
+      .map((c) => c.snippet?.topLevelComment?.snippet?.textOriginal ?? "")
+      .filter(Boolean);
+    console.log(
+      `[YouTube] getVideoComments videoId=${videoId} returned ${comments.length} in ${Date.now() - startedAt}ms`,
+    );
+    return comments;
+  } catch (err) {
+    const e = err as { code?: number; errors?: { reason?: string }[] };
+    // Comments disabled on this video is a common, expected case — don't blow up
+    // the whole pipeline, just return [] so the sentiment step can mark neutral.
+    if (e?.code === 403) {
+      const reason = e.errors?.[0]?.reason ?? "forbidden";
+      console.log(`[YouTube] comments unavailable for ${videoId} (${reason})`);
+      return [];
+    }
+    if (isQuotaExceeded(err)) throw new Error("YouTube API quota exceeded for the day");
+    throw err;
+  }
+}

@@ -38,6 +38,7 @@ export async function generateConcepts(args: {
   channelTitle: string;
   country?: string;
   profile: string;
+  scorecardSummary?: string;
 }): Promise<BrandConcept[]> {
   const startedAt = Date.now();
   const { text } = await generateText({
@@ -50,6 +51,7 @@ export async function generateConcepts(args: {
       channelTitle: args.channelTitle,
       country: args.country,
       profile: args.profile,
+      scorecardSummary: args.scorecardSummary,
     }),
     temperature: 0.65,
     maxOutputTokens: 2000,

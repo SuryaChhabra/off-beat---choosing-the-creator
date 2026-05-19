@@ -11,6 +11,7 @@ import Image from "next/image";
 import Link from "next/link";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { RefinementChat } from "./RefinementChat";
+import { SponsorScorecard, type SponsorScorecardData } from "./SponsorScorecard";
 
 const META_START = "__OFFBEAT_META_START__";
 const META_END = "__OFFBEAT_META_END__";
@@ -132,13 +133,20 @@ export function ResultsView({ handle }: { handle: string }) {
   const [conceptsLoading, setConceptsLoading] = useState(false);
   const [conceptsError, setConceptsError] = useState<string | null>(null);
 
+  // Sponsor scorecard runs in parallel with the profile stream. The fetched
+  // promise is stashed in a ref so the profile's onFinish callback can await
+  // it before firing /api/concepts — concepts depend on the scorecard summary
+  // for risk-aware suggestions.
+  const scorecardStartedRef = useRef(false);
+  const scorecardPromiseRef = useRef<Promise<{ summary: string } | null> | null>(null);
+  const [scorecard, setScorecard] = useState<SponsorScorecardData | null>(null);
+  const [scorecardLoading, setScorecardLoading] = useState(true);
+  const [scorecardError, setScorecardError] = useState<string | null>(null);
+
   const { completion, complete, isLoading, error } = useCompletion({
     api: "/api/analyze",
     streamProtocol: "text",
-    onFinish: (_prompt, full) => {
-      // Fires once when the profile stream finishes. We use this (rather
-      // than an effect) so setState happens in event-callback context, not
-      // inside the render → effect cycle. Concept fetch runs exactly once.
+    onFinish: async (_prompt, full) => {
       if (conceptsRequestedRef.current) return;
       const { meta: finishedMeta, analysis: finishedAnalysis } = parseStream(full);
       if (!finishedMeta || !finishedAnalysis.trim()) return;
@@ -147,25 +155,34 @@ export function ResultsView({ handle }: { handle: string }) {
       setConceptsLoading(true);
       setConceptsError(null);
 
-      fetch("/api/concepts", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          channelTitle: finishedMeta.title,
-          country: finishedMeta.country,
-          profile: finishedAnalysis,
-        }),
-      })
-        .then(async (r) => {
-          if (!r.ok) {
-            const body = (await r.json().catch(() => ({}))) as { error?: string };
-            throw new Error(body.error || `Concepts request failed (${r.status})`);
-          }
-          return r.json() as Promise<{ concepts: BrandConcept[] }>;
-        })
-        .then((data) => setConcepts(data.concepts))
-        .catch((e: Error) => setConceptsError(e.message))
-        .finally(() => setConceptsLoading(false));
+      // Wait for the in-flight scorecard fetch so concepts can be informed by
+      // the summary. Scorecard errors don't block concepts — they just mean
+      // no summary injection.
+      const scResult = await (scorecardPromiseRef.current ?? Promise.resolve(null));
+      const scorecardSummary = scResult?.summary;
+
+      try {
+        const r = await fetch("/api/concepts", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            channelTitle: finishedMeta.title,
+            country: finishedMeta.country,
+            profile: finishedAnalysis,
+            scorecardSummary,
+          }),
+        });
+        if (!r.ok) {
+          const body = (await r.json().catch(() => ({}))) as { error?: string };
+          throw new Error(body.error || `Concepts request failed (${r.status})`);
+        }
+        const data = (await r.json()) as { concepts: BrandConcept[] };
+        setConcepts(data.concepts);
+      } catch (e) {
+        setConceptsError((e as Error).message);
+      } finally {
+        setConceptsLoading(false);
+      }
     },
   });
 
@@ -174,6 +191,35 @@ export function ResultsView({ handle }: { handle: string }) {
     startedRef.current = true;
     void complete(handle, { body: { query: handle } });
   }, [handle, complete]);
+
+  // Kick off the sponsor scorecard fetch on mount in parallel with the
+  // profile stream. Stash the promise so onFinish can await it.
+  useEffect(() => {
+    if (scorecardStartedRef.current) return;
+    scorecardStartedRef.current = true;
+    const p = fetch(`/api/sponsors/${encodeURIComponent(handle)}`)
+      .then(async (r) => {
+        if (!r.ok) {
+          const body = (await r.json().catch(() => ({}))) as { error?: string };
+          throw new Error(body.error ?? `Sponsors request failed (${r.status})`);
+        }
+        return r.json() as Promise<{
+          scorecard: SponsorScorecardData;
+          summary: string;
+        }>;
+      })
+      .then((data) => {
+        setScorecard(data.scorecard);
+        setScorecardLoading(false);
+        return { summary: data.summary };
+      })
+      .catch((e: Error) => {
+        setScorecardError(e.message);
+        setScorecardLoading(false);
+        return null;
+      });
+    scorecardPromiseRef.current = p;
+  }, [handle]);
 
   const { meta, analysis } = useMemo(() => parseStream(completion), [completion]);
   const sections = useMemo(() => splitSections(analysis), [analysis]);
@@ -206,6 +252,12 @@ export function ResultsView({ handle }: { handle: string }) {
         <TrustBlock section={trust} loading={isLoading} />
         <CommentsBlock section={comments} loading={isLoading} />
         <ThemesBlock section={themes} loading={isLoading} />
+
+        <SponsorScorecard
+          scorecard={scorecard}
+          loading={scorecardLoading}
+          error={scorecardError}
+        />
 
         <ConceptsBlock
           concepts={concepts}

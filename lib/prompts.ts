@@ -84,6 +84,7 @@ export function buildConceptSeedPrompt(args: {
   channelTitle: string;
   country?: string;
   profile: string;
+  scorecardSummary?: string;
 }): string {
   const lines: string[] = [];
   lines.push(`Channel: ${args.channelTitle}`);
@@ -93,8 +94,90 @@ export function buildConceptSeedPrompt(args: {
   lines.push("---");
   lines.push(args.profile.trim());
   lines.push("---");
+  if (args.scorecardSummary && args.scorecardSummary.trim()) {
+    lines.push("");
+    lines.push("Past sponsor performance (last 6 months):");
+    lines.push("---");
+    lines.push(args.scorecardSummary.trim());
+    lines.push("---");
+    lines.push("");
+    lines.push(
+      "Lean concepts toward categories adjacent to brands that scored Strong/Solid. " +
+        "Avoid categories that Flopped. Cite specific scorecard entries in the wedge reasoning where applicable.",
+    );
+  }
   lines.push("");
   lines.push("Generate the 3 brand concepts now, one per risk tier, in the required JSON shape.");
+  return lines.join("\n");
+}
+
+// Sponsor extraction — Haiku reads a single video description and decides
+// whether a brand sponsored this video. Conservative: when unsure, returns
+// sponsored:false. Pipeline runs this ~50x per channel analysis, so the prompt
+// stays tight and the output is strict JSON.
+export const SPONSOR_EXTRACTION_PROMPT = `You analyze YouTube video descriptions to detect brand sponsorships. Be conservative — only return sponsored:true when there is clear, explicit sponsor evidence in the description text. If you are not sure, return false.
+
+Counts as sponsorship:
+- "thanks to X for sponsoring", "brought to you by X", "sponsored by X", "in partnership with X", "today's video is sponsored by X"
+- "#ad", "#sponsored", "[ad]", "(paid promotion)"
+- Promo / discount codes ("use code BHUVAN at brand.com")
+- Affiliate / tracked links to a clearly external brand (brand.com/yt, bit.ly to a brand domain)
+- "Try / get / shop X at <link>" where X is an unrelated commercial brand
+
+Does NOT count — return sponsored:false:
+- The creator's own merch, shop, books, courses, app, Patreon, channel memberships
+- Friend / collaborator creator links and social handles
+- News mentions of brands the creator does not promote
+- Music attribution, gear lists, software credits with no commercial CTA
+- Generic CTAs to subscribe, follow on Instagram, join Discord, etc.
+
+If multiple brands appear in one description, return the single most prominent paid one.
+
+Output STRICT JSON only — no markdown fences, no commentary:
+{"sponsored": boolean, "brand": string | null, "evidence": string | null}
+
+- \`brand\`: clean brand name only (e.g. "Skillshare", not "skillshare.com/abc"). Title case the brand if it's obvious; preserve casing for stylized names. Null when sponsored is false.
+- \`evidence\`: one short quote from the description proving it (≤ 80 chars). Null when sponsored is false.`;
+
+export function buildSponsorExtractionUserPrompt(description: string): string {
+  const trimmed = description.trim().slice(0, 6000); // descriptions can be huge; cap defensively
+  return `VIDEO DESCRIPTION:\n---\n${trimmed || "(empty)"}\n---\n\nReturn the JSON now.`;
+}
+
+// Comment sentiment — Haiku looks at the top-relevance comments for a single
+// sponsored video and classifies audience reception of that specific brand.
+export const COMMENT_SENTIMENT_PROMPT = `You analyze YouTube audience comments to assess how viewers received a specific brand sponsorship in this video. You will receive the brand name and up to ~50 top-relevance comments.
+
+Output STRICT JSON only — no markdown fences, no commentary:
+{"sentiment": "positive" | "neutral" | "mixed" | "negative", "evidence": string}
+
+Categories:
+- positive — audience engaged with the brand positively: asked about the product, said they used the code, complimented the integration, said the brand fits the creator.
+- neutral — comments mostly ignore the brand and focus on the content / creator. Default when in doubt.
+- mixed — clearly split; meaningful share both supportive and critical.
+- negative — audience pushed back: called the integration out, said they skipped, accused selling out, mocked the brand, complained about the product, said it didn't fit.
+
+\`evidence\`: one sentence summarizing what you actually observed in the comments (≤ 140 chars). Quote fragments are fine. Be specific — name the pattern you saw.
+
+Hard rules:
+- "Positive" requires real engagement with the brand, not just generally positive video comments. If they liked the video but ignored the sponsor, that's neutral.
+- If there are no comments (audience silence on the brand, or comments disabled), return neutral with evidence "No brand-specific reaction observed."`;
+
+export function buildCommentSentimentUserPrompt(brand: string, comments: string[]): string {
+  const lines: string[] = [];
+  lines.push(`Brand: ${brand}`);
+  lines.push("");
+  lines.push(`Top comments (${comments.length}, by relevance):`);
+  if (comments.length === 0) {
+    lines.push("(no comments retrieved — comments may be disabled or removed)");
+  } else {
+    comments.forEach((c, i) => {
+      const clean = c.replace(/\s+/g, " ").trim().slice(0, 280);
+      lines.push(`${i + 1}. ${clean}`);
+    });
+  }
+  lines.push("");
+  lines.push("Return the JSON now.");
   return lines.join("\n");
 }
 

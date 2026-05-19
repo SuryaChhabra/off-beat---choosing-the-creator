@@ -1,8 +1,11 @@
 // POST /api/concepts
-// Body: { channelTitle: string, country?: string, profile: string }
+// Body: { channelTitle, country?, profile, scorecardSummary? }
 // Returns: { concepts: BrandConcept[] } — exactly 3, ordered by risk tier.
 //
-// Called by the results page once the Creator Profile stream has finished.
+// Called by the results page once the Creator Profile stream finishes AND
+// the sponsor scorecard has loaded. scorecardSummary is the short string
+// produced by buildScorecardSummary(); it gets folded into the prompt so
+// concepts lean toward Strong/Solid categories and avoid Flopped ones.
 
 import { generateConcepts } from "@/lib/concepts";
 
@@ -14,6 +17,7 @@ type Body = {
   channelTitle?: unknown;
   country?: unknown;
   profile?: unknown;
+  scorecardSummary?: unknown;
 };
 
 export async function POST(req: Request) {
@@ -27,6 +31,8 @@ export async function POST(req: Request) {
   const channelTitle = typeof body.channelTitle === "string" ? body.channelTitle.trim() : "";
   const profile = typeof body.profile === "string" ? body.profile.trim() : "";
   const country = typeof body.country === "string" ? body.country : undefined;
+  const scorecardSummary =
+    typeof body.scorecardSummary === "string" ? body.scorecardSummary : undefined;
 
   if (!channelTitle) {
     return Response.json({ error: "Missing 'channelTitle'" }, { status: 400 });
@@ -36,7 +42,12 @@ export async function POST(req: Request) {
   }
 
   try {
-    const concepts = await generateConcepts({ channelTitle, country, profile });
+    const concepts = await generateConcepts({
+      channelTitle,
+      country,
+      profile,
+      scorecardSummary,
+    });
     return Response.json({ concepts }, { status: 200 });
   } catch (err) {
     console.error("[/api/concepts] failed:", err);
