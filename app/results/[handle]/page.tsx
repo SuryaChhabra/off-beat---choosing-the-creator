@@ -8,7 +8,7 @@ export async function generateMetadata({ params }: { params: RouteParams }) {
   const { handle } = await params;
   const decoded = safeDecode(handle);
   return {
-    title: `${decoded} — OFF/BEAT Creator Profile`,
+    title: `${decoded} — Concept Lab Creator Profile`,
   };
 }
 

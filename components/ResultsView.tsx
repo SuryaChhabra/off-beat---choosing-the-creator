@@ -240,7 +240,7 @@ export function ResultsView({ handle }: { handle: string }) {
         <Link href="/" className="results-back">
           ← Analyze another
         </Link>
-        <span className="results-brand">OFF/BEAT</span>
+        <span className="results-brand">CONCEPT LAB</span>
       </header>
 
       {error && <ErrorBlock message={error.message} />}

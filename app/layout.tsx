@@ -9,7 +9,7 @@ const inter = Inter({
 });
 
 export const metadata: Metadata = {
-  title: "OFF/BEAT — Audience hai · ab brand banao",
+  title: "Concept Lab — Audience hai · ab brand banao",
   description:
     "Drop in any creator. We map their audience, score the categories their audience actually buys, and surface brand concepts grounded in evidence — not vibes.",
 };
@@ -21,7 +21,15 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en" className={`${inter.variable} h-full antialiased`}>
-      <body className="min-h-full flex flex-col">{children}</body>
+      <body className="min-h-full flex flex-col">
+        {children}
+        <footer className="site-footer">
+          <p>
+            An unofficial fan demo by Surya Chhabra. Not affiliated with OFF/BEAT
+            Studio. Yet.
+          </p>
+        </footer>
+      </body>
     </html>
   );
 }

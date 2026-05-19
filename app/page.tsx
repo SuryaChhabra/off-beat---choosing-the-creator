@@ -12,16 +12,14 @@ export default function Home() {
       <div style={{ marginBottom: "5rem" }}>
         <span
           style={{
-            background: "var(--pink)",
-            color: "var(--bg)",
-            padding: "6px 14px",
-            borderRadius: 6,
-            fontSize: 14,
-            letterSpacing: "0.01em",
+            color: "var(--pink)",
+            fontSize: 16,
+            letterSpacing: "0.22em",
+            textTransform: "uppercase",
             display: "inline-block",
           }}
         >
-          OFF/BEAT
+          CONCEPT LAB
         </span>
       </div>
 
