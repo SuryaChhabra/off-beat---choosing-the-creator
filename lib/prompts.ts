@@ -96,14 +96,26 @@ export function buildConceptSeedPrompt(args: {
   lines.push("---");
   if (args.scorecardSummary && args.scorecardSummary.trim()) {
     lines.push("");
-    lines.push("Past sponsor performance (last 6 months):");
+    lines.push("Past sponsor performance (last 18 months, recurrence across all-time):");
     lines.push("---");
     lines.push(args.scorecardSummary.trim());
     lines.push("---");
     lines.push("");
+    lines.push("Use this to inform concept generation:");
     lines.push(
-      "Lean concepts toward categories adjacent to brands that scored Strong/Solid. " +
-        "Avoid categories that Flopped. Cite specific scorecard entries in the wedge reasoning where applicable.",
+      "- Categories where brands scored Strong AND Active = audience converts here, durable interest.",
+    );
+    lines.push(
+      "- Categories where brands scored Solid AND Recent = audience is receptive, opportunity to own the category.",
+    );
+    lines.push(
+      "- Categories where brands Flopped = avoid these categories, or reframe the angle so the failure mode doesn't repeat.",
+    );
+    lines.push(
+      "- Long-term partnerships (totalAppearancesAllTime ≥ 3 across 12+ months) = strongest signal of audience-category fit; bias toward adjacent or upmarket plays there.",
+    );
+    lines.push(
+      "Cite specific scorecard entries in the wedge reasoning where applicable.",
     );
   }
   lines.push("");
@@ -111,37 +123,98 @@ export function buildConceptSeedPrompt(args: {
   return lines.join("\n");
 }
 
-// Sponsor extraction — Haiku reads a single video description and decides
-// whether a brand sponsored this video. Conservative: when unsure, returns
-// sponsored:false. Pipeline runs this ~50x per channel analysis, so the prompt
-// stays tight and the output is strict JSON.
-export const SPONSOR_EXTRACTION_PROMPT = `You analyze YouTube video descriptions to detect brand sponsorships. Be conservative — only return sponsored:true when there is clear, explicit sponsor evidence in the description text. If you are not sure, return false.
+// Sponsor extraction — Haiku reads a YouTube video's title + description and
+// decides (a) whether the video contains a paid sponsorship, (b) whether it
+// contains affiliate links (lower-tier paid relationship), and (c) which
+// brand(s) are involved. Conservative: when unsure, returns false.
+// Output schema is intentionally an array of brands — many creator videos
+// have 2–4 sponsors in one upload, especially in the unboxing / haul format.
+export const SPONSOR_EXTRACTION_PROMPT = `You analyze YouTube videos (title + description) to detect paid brand relationships. Two separate signals to report:
 
-Counts as sponsorship:
-- "thanks to X for sponsoring", "brought to you by X", "sponsored by X", "in partnership with X", "today's video is sponsored by X"
-- "#ad", "#sponsored", "[ad]", "(paid promotion)"
-- Promo / discount codes ("use code BHUVAN at brand.com")
-- Affiliate / tracked links to a clearly external brand (brand.com/yt, bit.ly to a brand domain)
-- "Try / get / shop X at <link>" where X is an unrelated commercial brand
+1) sponsored — there is an explicit paid endorsement / integration in this video.
+2) affiliate — the video contains affiliate / tracked links to brand pages but no explicit sponsor language. Affiliate without sponsorship is a weaker paid relationship and should NOT be marked sponsored.
 
-Does NOT count — return sponsored:false:
-- The creator's own merch, shop, books, courses, app, Patreon, channel memberships
-- Friend / collaborator creator links and social handles
+A single video can have both (sponsored brand + Amazon affiliate links to gear).
+
+Counts as sponsored (sponsored: true):
+- "Sponsored by X", "Thanks to X for sponsoring", "Brought to you by X", "Today's video is sponsored by X", "In partnership with X"
+- Explicit "#ad", "#sponsored", "#paidpartnership", "[ad]", "(paid promotion)" in title or description
+- Promo / discount codes attached to a specific external brand ("Use code BHUVAN at brand.com", "Get 20% off at X")
+- "Try / shop X at <link>" phrasing with a clear commercial CTA from a specific brand
+
+Counts as affiliate (affiliate: true, sponsored: false UNLESS sponsored language is also present):
+- Amazon affiliate links (amzn.to, amazon.com/?tag=…)
+- ShareASale, Impact, Awin, LTK, RewardStyle, "earn commission" disclaimers
+- "Links below are affiliate links and I may earn a commission"
+
+Does NOT count — return sponsored:false, affiliate:false:
+- The creator's own merch, shop, books, courses, app, Patreon, channel memberships, Substack
+- Friend / collaborator creator links, social handles, Discord, newsletter
 - News mentions of brands the creator does not promote
-- Music attribution, gear lists, software credits with no commercial CTA
-- Generic CTAs to subscribe, follow on Instagram, join Discord, etc.
+- Music attribution, gear lists without affiliate disclosure
+- Brands mentioned as the SUBJECT of the video (e.g. "I tried 10 skincare brands" — the brands tested are NOT sponsors)
+- Generic CTAs (Subscribe, like, comment, follow IG)
 
-If multiple brands appear in one description, return the single most prominent paid one.
+Brand extraction rules:
+- Return ALL distinct paid / affiliate brands in this video, in the order they appear.
+- For each brand: clean name only ("Skillshare", not "skillshare.com/abc"; "Bluehost", not "bluehost.com/yt"). Preserve stylized casing ("boAt", "L'Oréal Paris").
+- If a sponsor brand can't be identified from the text but the video is clearly sponsored, return brands: [] and the post-processor will handle it.
+- Do NOT include the creator's own brand or the subject-of-the-video brands.
 
 Output STRICT JSON only — no markdown fences, no commentary:
-{"sponsored": boolean, "brand": string | null, "evidence": string | null}
+{"sponsored": boolean, "brands": string[], "affiliate": boolean, "evidence": string}
 
-- \`brand\`: clean brand name only (e.g. "Skillshare", not "skillshare.com/abc"). Title case the brand if it's obvious; preserve casing for stylized names. Null when sponsored is false.
-- \`evidence\`: one short quote from the description proving it (≤ 80 chars). Null when sponsored is false.`;
+- evidence: one sentence (≤ 140 chars) summarizing what made you decide — quote a key phrase from the source if possible.`;
 
-export function buildSponsorExtractionUserPrompt(description: string): string {
-  const trimmed = description.trim().slice(0, 6000); // descriptions can be huge; cap defensively
-  return `VIDEO DESCRIPTION:\n---\n${trimmed || "(empty)"}\n---\n\nReturn the JSON now.`;
+export function buildSponsorExtractionUserPrompt(input: {
+  title: string;
+  description: string;
+  paidProductPlacement: boolean;
+}): string {
+  const description = input.description.trim().slice(0, 6000); // cap defensively
+  const lines: string[] = [];
+  lines.push(`TITLE: ${input.title.trim() || "(empty)"}`);
+  lines.push("");
+  lines.push("DESCRIPTION:");
+  lines.push("---");
+  lines.push(description || "(empty)");
+  lines.push("---");
+  if (input.paidProductPlacement) {
+    lines.push("");
+    lines.push(
+      "NOTE: YouTube's paidProductPlacement flag is TRUE for this video. Sponsorship presence is confirmed by the platform — use the text to identify which brand. If the text gives no usable brand name, still return sponsored:true with brands:[] and we'll mark it Unknown.",
+    );
+  }
+  lines.push("");
+  lines.push("Return the JSON now.");
+  return lines.join("\n");
+}
+
+// Brand normalization — collapses variants of the same brand into one canonical
+// name across a single channel's extracted sponsors. One Haiku call per
+// scorecard run. Caller passes the deduped raw list; we return the mapping.
+export const BRAND_NORMALIZATION_PROMPT = `You are given a list of raw brand strings extracted from one YouTube channel's video descriptions over the last 18 months. Your job is to collapse VARIANTS of the same brand into one canonical name, while preserving truly distinct brands.
+
+Collapse rules:
+- Variants of the same brand → one canonical (e.g. "Tetley", "Tetley Tea", "Tata Tetley" → "Tetley"). Choose the cleanest, most recognizable form.
+- Sub-brands of the same parent → same canonical when the parent is what the audience would actually recognize ("Plum Goodness" and "Plum Goodness Skincare" → "Plum Goodness"). But do NOT collapse genuinely distinct sister brands ("Plum" and "Mamaearth" stay separate; "Coca-Cola" and "Sprite" stay separate even though both are TCCC).
+- Casing / punctuation drift → canonical with the brand's preferred casing ("boat", "Boat", "BOAT" → "boAt").
+- "Unknown" stays "Unknown" — do not invent a brand for it.
+
+Output STRICT JSON only, no markdown fences, no commentary. The output is an object that maps EVERY raw input string (verbatim, including casing) to its canonical name:
+
+{"<rawName1>": "<canonical1>", "<rawName2>": "<canonical2>", ...}
+
+Every raw string must appear as a key, even if its canonical equals itself.`;
+
+export function buildBrandNormalizationUserPrompt(rawBrands: string[]): string {
+  const unique = Array.from(new Set(rawBrands)).filter((s) => s && s.trim());
+  const lines: string[] = [];
+  lines.push("Raw brand strings:");
+  unique.forEach((b) => lines.push(`- ${b}`));
+  lines.push("");
+  lines.push("Return the mapping JSON now. Every raw string must be a key.");
+  return lines.join("\n");
 }
 
 // Comment sentiment — Haiku looks at the top-relevance comments for a single

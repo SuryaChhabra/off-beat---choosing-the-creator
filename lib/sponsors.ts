@@ -1,24 +1,37 @@
-// Sponsor scorecard pipeline.
-// Given a channelId, extracts every paid brand integration in the last 6 months,
-// measures it against the creator's view baseline, samples audience sentiment
-// per brand, and scores each entry Strong / Solid / Mixed / Flopped.
+// Sponsor scorecard pipeline (v2 — full spec).
 //
-// This module makes a lot of Haiku calls (~50 for extraction + N for sentiment).
-// Callers MUST go through the 24h cache wrapper at the route layer.
+// Output: SponsorScorecard[] — one row per canonical brand.
+//
+// Two-pass video fetch:
+//   Pass A (past 18mo, ≤100 longform + ≤100 shorts): full metadata → Haiku
+//     extraction (multi-brand per video, sponsored vs affiliate, paid-
+//     placement flag cross-reference) → per-brand grouping → sentiment.
+//   Pass B (all-time, lightweight): playlistItems.list snippet only, used
+//     for recurrence/firstSeen/lastSeen substring scan. No Haiku.
+//
+// Brand normalization runs once (Haiku) across the unique raw brand strings
+// from Pass A so "Tetley" / "Tetley Tea" / "Tata Tetley" collapse to one row.
+//
+// Cost shape: ~150 Pass-A extractions + 1 normalization + ~15 sentiments ≈
+// ~170 Haiku calls per uncached run. Caller MUST go through the 24h cache.
 
 import { complete, HAIKU_MODEL } from "./anthropic";
 import {
+  buildBrandNormalizationUserPrompt,
   buildCommentSentimentUserPrompt,
   buildSponsorExtractionUserPrompt,
+  BRAND_NORMALIZATION_PROMPT,
   COMMENT_SENTIMENT_PROMPT,
   SPONSOR_EXTRACTION_PROMPT,
 } from "./prompts";
 import {
+  getAllPlaylistVideosLight,
   getPlaylistVideoIds,
   getUploadsPlaylistId,
   getVideoComments,
   getVideoDetails,
   type DetailedVideo,
+  type LightVideo,
 } from "./youtube";
 
 // ---------------------------------------------------------------------------
@@ -31,41 +44,58 @@ export type SponsorSignal = (typeof SPONSOR_SIGNALS)[number];
 export const SPONSOR_SENTIMENTS = ["positive", "neutral", "mixed", "negative"] as const;
 export type SponsorSentiment = (typeof SPONSOR_SENTIMENTS)[number];
 
-export type SponsorEntry = {
-  brand: string;
-  integrationCount: number;
-  videoIds: string[];
-  topVideoId: string;
-  avgViewsVsBaseline: number; // ratio: 1.0 = baseline; 1.4 = 40% above
-  sentiment: SponsorSentiment;
-  sentimentEvidence: string;
-  recurrence: boolean;
+export type Freshness = "Active" | "Recent" | "Dormant";
+export type ContentType = "longform" | "shorts" | "both";
+
+export type SponsorScorecard = {
+  brand: string; // canonical name
+  contentType: ContentType;
+  integrationsRecent: number; // count of sponsored videos in past 18mo
+  videoIdsRecent: string[];
+  totalAppearancesAllTime: number;
+  firstSeenAt: string; // ISO date (all-time)
+  lastSeenAt: string; // ISO date (all-time)
+  freshness: Freshness;
+  avgViewsVsBaseline: number; // weighted across format-specific baselines
+  sentiment: SponsorSentiment | null;
+  sentimentEvidence: string | null;
+  returnedAfterFirst: boolean; // totalAppearancesAllTime > 1
+  affiliate: boolean; // true if appearances were affiliate-only, not sponsored
   signal: SponsorSignal;
 };
 
-export type SponsorScorecard = {
-  windowDays: number;
-  totalVideosInWindow: number;
-  baselineMedianViews: number;
-  sponsoredVideoCount: number;
-  sponsors: SponsorEntry[];
-};
-
 // ---------------------------------------------------------------------------
-// Tunables — keep at the top so it's easy to dial up/down without spelunking.
+// Tunables — keep at the top.
 // ---------------------------------------------------------------------------
 
-const WINDOW_DAYS = 180; // ~6 months
-const MAX_VIDEOS_TO_FETCH = 50;
-const EXTRACTION_CONCURRENCY = 6;
+const WINDOW_MONTHS = 18;
+const WINDOW_MS = WINDOW_MONTHS * 30 * 24 * 60 * 60 * 1000;
+
+const SHORTS_THRESHOLD_SECONDS = 60;
+const MAX_LONGFORM = 100;
+const MAX_SHORTS = 100;
+const MAX_VIDEOS_TO_INSPECT = 250; // Pass-A pre-classification page cap
+
+const ALL_TIME_LIGHT_CAP = 5000; // safety bound on Pass B
+
+const EXTRACTION_CONCURRENCY = 8;
 const SENTIMENT_CONCURRENCY = 4;
 const SENTIMENT_COMMENT_COUNT = 50;
+
+const ACTIVE_CUTOFF_MS = 3 * 30 * 24 * 60 * 60 * 1000; // 3 months
+const RECENT_CUTOFF_MS = 12 * 30 * 24 * 60 * 60 * 1000; // 12 months
 
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-type Extraction = { sponsored: boolean; brand: string | null; evidence: string | null };
+type RawExtraction = {
+  sponsored: boolean;
+  brands: string[];
+  affiliate: boolean;
+  evidence: string;
+};
+
 type Sentiment = { sentiment: SponsorSentiment; evidence: string };
 
 function stripJsonFence(text: string): string {
@@ -76,21 +106,36 @@ function stripJsonFence(text: string): string {
     .trim();
 }
 
-function isExtraction(x: unknown): x is Extraction {
+function isStringArray(x: unknown): x is string[] {
+  return Array.isArray(x) && x.every((v) => typeof v === "string");
+}
+
+function isExtraction(x: unknown): x is RawExtraction {
   if (!x || typeof x !== "object") return false;
   const o = x as Record<string, unknown>;
-  if (typeof o.sponsored !== "boolean") return false;
-  if (o.brand !== null && typeof o.brand !== "string") return false;
-  if (o.evidence !== null && typeof o.evidence !== "string") return false;
-  return true;
+  return (
+    typeof o.sponsored === "boolean" &&
+    typeof o.affiliate === "boolean" &&
+    isStringArray(o.brands) &&
+    typeof o.evidence === "string"
+  );
 }
 
 function isSentiment(x: unknown): x is Sentiment {
   if (!x || typeof x !== "object") return false;
   const o = x as Record<string, unknown>;
-  if (typeof o.sentiment !== "string") return false;
-  if (!(SPONSOR_SENTIMENTS as readonly string[]).includes(o.sentiment)) return false;
-  if (typeof o.evidence !== "string") return false;
+  return (
+    typeof o.sentiment === "string" &&
+    (SPONSOR_SENTIMENTS as readonly string[]).includes(o.sentiment) &&
+    typeof o.evidence === "string"
+  );
+}
+
+function isStringMap(x: unknown): x is Record<string, string> {
+  if (!x || typeof x !== "object") return false;
+  for (const v of Object.values(x as Record<string, unknown>)) {
+    if (typeof v !== "string") return false;
+  }
   return true;
 }
 
@@ -115,39 +160,65 @@ function median(nums: number[]): number {
   return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
 }
 
-function normalizeBrand(raw: string): string {
+function normalizeBrandKey(raw: string): string {
   return raw
     .replace(/[®™©]/g, "")
     .replace(/[.,'"]+$/g, "")
     .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+function cleanBrandRaw(raw: string): string {
+  return raw
+    .replace(/[®™©]/g, "")
+    .replace(/\s+/g, " ")
     .trim();
 }
 
-function brandKey(raw: string): string {
-  return normalizeBrand(raw).toLowerCase();
-}
-
-function withinWindow(publishedAt: string, days: number): boolean {
-  if (!publishedAt) return false;
+function withinWindow(publishedAt: string): boolean {
   const ts = Date.parse(publishedAt);
   if (Number.isNaN(ts)) return false;
-  return Date.now() - ts <= days * 24 * 60 * 60 * 1000;
+  return Date.now() - ts <= WINDOW_MS;
+}
+
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function brandMentionRegex(canonical: string): RegExp {
+  // Word-boundary lookalike that also accepts non-ASCII letters in the brand
+  // (e.g. "L'Oréal Paris"). We require boundaries on the ends so "plum" doesn't
+  // match "plumber".
+  return new RegExp(`(^|[^\\p{L}\\p{N}])${escapeRegex(canonical)}(?=$|[^\\p{L}\\p{N}])`, "iu");
+}
+
+function freshnessFor(lastSeenAt: string): Freshness {
+  const ts = Date.parse(lastSeenAt);
+  if (Number.isNaN(ts)) return "Dormant";
+  const age = Date.now() - ts;
+  if (age <= ACTIVE_CUTOFF_MS) return "Active";
+  if (age <= RECENT_CUTOFF_MS) return "Recent";
+  return "Dormant";
 }
 
 function tier(
   ratio: number,
-  sentiment: SponsorSentiment,
-  recurrence: boolean,
+  sentiment: SponsorSentiment | null,
+  totalAppearancesAllTime: number,
 ): SponsorSignal {
-  // Negative sentiment is a hard veto — even high views read as backlash.
+  // Hard veto: negative sentiment is Flopped regardless of views.
   if (sentiment === "negative") return "Flopped";
-  if (ratio < 0.8) return "Flopped";
-  if (ratio >= 1.2 && sentiment === "positive" && recurrence) return "Strong";
+  if (ratio > 0 && ratio < 0.8) return "Flopped";
+
+  const returned = totalAppearancesAllTime > 1;
+  if (ratio >= 1.2 && sentiment === "positive" && returned) return "Strong";
   if (ratio >= 1.0) return "Solid";
-  if (sentiment === "positive" && recurrence) return "Solid";
+  if (sentiment === "positive" && returned) return "Solid";
   if (sentiment === "mixed") return "Mixed";
-  if (ratio < 1.0) return "Mixed"; // i.e. 0.8 ≤ ratio < 1.0
-  return "Solid";
+  if (ratio >= 0.8 && ratio < 1.0) return "Mixed";
+  // No ratio data and no useful sentiment — call it Mixed rather than Strong/Flopped.
+  return "Mixed";
 }
 
 const TIER_RANK: Record<SponsorSignal, number> = {
@@ -158,37 +229,96 @@ const TIER_RANK: Record<SponsorSignal, number> = {
 };
 
 // ---------------------------------------------------------------------------
-// Haiku calls (one per video / one per brand)
+// Haiku calls
 // ---------------------------------------------------------------------------
 
-async function extractSponsor(description: string): Promise<Extraction> {
-  // Short-circuit obvious empties — saves a Haiku call.
-  if (!description || description.trim().length < 20) {
-    return { sponsored: false, brand: null, evidence: null };
+async function extractSponsor(
+  video: DetailedVideo,
+): Promise<RawExtraction> {
+  const empty: RawExtraction = {
+    sponsored: false,
+    brands: [],
+    affiliate: false,
+    evidence: "",
+  };
+
+  // Even when the description is empty, if YouTube's paidProductPlacement flag
+  // is set we still want a row in the scorecard. Pre-fill from the flag and
+  // let the Haiku call try to find a brand name; if it can't, we fall back to
+  // "Unknown" below.
+  if (!video.description || video.description.trim().length < 5) {
+    if (!video.paidProductPlacement) return empty;
+    return {
+      sponsored: true,
+      brands: [],
+      affiliate: false,
+      evidence: "YouTube paidProductPlacement flag set; description empty.",
+    };
   }
 
   try {
     const { text } = await complete({
       model: HAIKU_MODEL,
       system: SPONSOR_EXTRACTION_PROMPT,
-      messages: [{ role: "user", content: buildSponsorExtractionUserPrompt(description) }],
-      maxTokens: 200,
+      messages: [
+        {
+          role: "user",
+          content: buildSponsorExtractionUserPrompt({
+            title: video.title,
+            description: video.description,
+            paidProductPlacement: video.paidProductPlacement,
+          }),
+        },
+      ],
+      maxTokens: 320,
       temperature: 0,
     });
     const cleaned = stripJsonFence(text);
     const parsed: unknown = JSON.parse(cleaned);
     if (!isExtraction(parsed)) {
-      console.warn("[sponsors] extraction shape mismatch, dropping:", parsed);
-      return { sponsored: false, brand: null, evidence: null };
-    }
-    // Defensive: model may say sponsored:true with brand:null — treat as false.
-    if (parsed.sponsored && (!parsed.brand || !parsed.brand.trim())) {
-      return { sponsored: false, brand: null, evidence: null };
+      console.warn("[sponsors] extraction shape mismatch:", parsed);
+      return video.paidProductPlacement
+        ? { sponsored: true, brands: [], affiliate: false, evidence: "Malformed model output, PPP flag set." }
+        : empty;
     }
     return parsed;
   } catch (err) {
-    console.warn("[sponsors] extraction failed (treating as not-sponsored):", err);
-    return { sponsored: false, brand: null, evidence: null };
+    console.warn("[sponsors] extraction failed:", err);
+    return video.paidProductPlacement
+      ? { sponsored: true, brands: [], affiliate: false, evidence: "Extraction failed, PPP flag set." }
+      : empty;
+  }
+}
+
+async function normalizeBrands(rawBrands: string[]): Promise<Record<string, string>> {
+  const unique = Array.from(new Set(rawBrands.map((s) => cleanBrandRaw(s)).filter(Boolean)));
+  if (unique.length === 0) return {};
+
+  // Identity fallback used when the model returns junk.
+  const identity = Object.fromEntries(unique.map((b) => [b, b]));
+
+  try {
+    const { text } = await complete({
+      model: HAIKU_MODEL,
+      system: BRAND_NORMALIZATION_PROMPT,
+      messages: [
+        { role: "user", content: buildBrandNormalizationUserPrompt(unique) },
+      ],
+      maxTokens: 800,
+      temperature: 0,
+    });
+    const cleaned = stripJsonFence(text);
+    const parsed: unknown = JSON.parse(cleaned);
+    if (!isStringMap(parsed)) {
+      console.warn("[sponsors] normalization shape mismatch, using identity map");
+      return identity;
+    }
+    // Fill in any missing keys with identity to be safe.
+    const merged: Record<string, string> = { ...identity, ...parsed };
+    return merged;
+  } catch (err) {
+    console.warn("[sponsors] normalization failed, using identity map:", err);
+    return identity;
   }
 }
 
@@ -203,7 +333,7 @@ async function analyzeSentiment(brand: string, comments: string[]): Promise<Sent
       messages: [
         { role: "user", content: buildCommentSentimentUserPrompt(brand, comments) },
       ],
-      maxTokens: 200,
+      maxTokens: 220,
       temperature: 0,
     });
     const cleaned = stripJsonFence(text);
@@ -223,181 +353,338 @@ async function analyzeSentiment(brand: string, comments: string[]): Promise<Sent
 // Public entry
 // ---------------------------------------------------------------------------
 
-export async function getSponsorScorecard(channelId: string): Promise<SponsorScorecard> {
+export async function getSponsorScorecard(channelId: string): Promise<SponsorScorecard[]> {
   const overallStart = Date.now();
-  console.log(`[sponsors] start channelId=${channelId}`);
+  console.log(`[sponsors] v2 start channelId=${channelId}`);
 
   const uploadsId = await getUploadsPlaylistId(channelId);
   if (!uploadsId) {
-    return emptyScorecard();
+    console.log(`[sponsors] no uploads playlist for ${channelId}`);
+    return [];
   }
 
-  const ids = await getPlaylistVideoIds(uploadsId, MAX_VIDEOS_TO_FETCH);
-  const inWindow = ids.filter((x) => withinWindow(x.publishedAt, WINDOW_DAYS));
-  if (inWindow.length === 0) {
-    console.log(`[sponsors] no videos in last ${WINDOW_DAYS}d for ${channelId}`);
-    return emptyScorecard();
+  // ---------- Pass A: recent window with full metadata --------------------
+  const allRecentIds = await getPlaylistVideoIds(uploadsId, MAX_VIDEOS_TO_INSPECT);
+  const inWindowIds = allRecentIds
+    .filter((v) => withinWindow(v.publishedAt))
+    .map((v) => v.videoId);
+
+  if (inWindowIds.length === 0) {
+    console.log(`[sponsors] no videos in last ${WINDOW_MONTHS}mo for ${channelId}`);
+    return [];
   }
 
-  const videos = await getVideoDetails(inWindow.map((x) => x.videoId));
-  // Filter again on videos.list timestamps (uploads playlist sometimes returns
-  // republished items with a later videoPublishedAt than the snippet date).
-  const inWindowDetailed = videos.filter((v) => withinWindow(v.publishedAt, WINDOW_DAYS));
-  if (inWindowDetailed.length === 0) {
-    return emptyScorecard();
-  }
+  const passADetails = await getVideoDetails(inWindowIds);
 
-  // 1) Per-video sponsor extraction (Haiku × N, bounded concurrency).
-  const extractions = await pMap(
-    inWindowDetailed,
-    (v) => extractSponsor(v.description),
-    EXTRACTION_CONCURRENCY,
+  // Classify shorts vs longform, then cap each format by recency.
+  const sortedByDate = [...passADetails].sort(
+    (a, b) => Date.parse(b.publishedAt) - Date.parse(a.publishedAt),
+  );
+  const longform: DetailedVideo[] = [];
+  const shorts: DetailedVideo[] = [];
+  for (const v of sortedByDate) {
+    if (v.durationSeconds > 0 && v.durationSeconds <= SHORTS_THRESHOLD_SECONDS) {
+      if (shorts.length < MAX_SHORTS) shorts.push(v);
+    } else {
+      if (longform.length < MAX_LONGFORM) longform.push(v);
+    }
+  }
+  const passA = [...longform, ...shorts];
+
+  console.log(
+    `[sponsors] Pass A: ${passA.length} videos (longform=${longform.length}, shorts=${shorts.length})`,
   );
 
-  const sponsoredVideos: { video: DetailedVideo; brand: string; evidence: string | null }[] = [];
-  const nonSponsoredViews: number[] = [];
-
-  inWindowDetailed.forEach((video, i) => {
-    const x = extractions[i];
-    if (x.sponsored && x.brand) {
-      sponsoredVideos.push({
-        video,
-        brand: normalizeBrand(x.brand),
-        evidence: x.evidence,
-      });
-    } else {
-      nonSponsoredViews.push(video.viewCount);
-    }
+  // ---------- Pass B: all-time lightweight scan ---------------------------
+  // Runs in parallel with the per-video extractions. We don't need it until
+  // Step 6 (recurrence), so kick it off as a side promise.
+  const passBPromise: Promise<LightVideo[]> = getAllPlaylistVideosLight(
+    uploadsId,
+    ALL_TIME_LIGHT_CAP,
+  ).catch((err) => {
+    console.warn("[sponsors] Pass B failed, recurrence will be limited to Pass A:", err);
+    return passA.map((v) => ({
+      videoId: v.videoId,
+      title: v.title,
+      description: v.description,
+      publishedAt: v.publishedAt,
+    })) satisfies LightVideo[];
   });
 
-  // 2) Baseline = median views of non-sponsored. Fall back to all videos if the
-  //    creator's recent slate is mostly paid (rare but possible).
-  const baseline =
-    median(nonSponsoredViews.length > 0 ? nonSponsoredViews : inWindowDetailed.map((v) => v.viewCount));
+  // ---------- Step 2: extract sponsors from Pass A ------------------------
+  const extractions = await pMap(passA, (v) => extractSponsor(v), EXTRACTION_CONCURRENCY);
 
-  if (sponsoredVideos.length === 0) {
-    console.log(
-      `[sponsors] no sponsored videos detected for ${channelId} ` +
-        `(checked ${inWindowDetailed.length}; baseline=${baseline.toLocaleString("en-US")}) ` +
-        `in ${Date.now() - overallStart}ms`,
-    );
+  // Per-video classification with paidProductPlacement fallback.
+  type PerVideo = {
+    video: DetailedVideo;
+    brands: string[]; // raw extracted brands, post-PPP fallback
+    sponsored: boolean;
+    affiliate: boolean;
+  };
+  const annotated: PerVideo[] = passA.map((video, i) => {
+    const ext = extractions[i];
+    let brands = ext.brands.map(cleanBrandRaw).filter(Boolean);
+
+    // PPP fallback: YouTube says paid but the model couldn't name a brand.
+    if (video.paidProductPlacement && (ext.sponsored || brands.length === 0) && brands.length === 0) {
+      brands = ["Unknown"];
+    }
+
     return {
-      windowDays: WINDOW_DAYS,
-      totalVideosInWindow: inWindowDetailed.length,
-      baselineMedianViews: baseline,
-      sponsoredVideoCount: 0,
-      sponsors: [],
+      video,
+      brands,
+      sponsored: ext.sponsored || video.paidProductPlacement,
+      affiliate: ext.affiliate,
+    };
+  });
+
+  // ---------- Step 3: brand normalization ---------------------------------
+  const rawSponsorBrands = annotated.flatMap((a) =>
+    a.sponsored || a.affiliate ? a.brands.filter((b) => b && b !== "Unknown") : [],
+  );
+  const normalizationMap = await normalizeBrands(rawSponsorBrands);
+
+  function canonical(raw: string): string {
+    if (raw === "Unknown") return "Unknown";
+    const clean = cleanBrandRaw(raw);
+    return normalizationMap[clean] ?? clean;
+  }
+
+  // ---------- Step 4: format-specific baselines ---------------------------
+  const sponsoredVideoIds = new Set<string>();
+  for (const a of annotated) {
+    if ((a.sponsored || a.affiliate) && a.brands.length > 0) {
+      sponsoredVideoIds.add(a.video.videoId);
+    }
+  }
+
+  const longformNonSponsoredViews = longform
+    .filter((v) => !sponsoredVideoIds.has(v.videoId))
+    .map((v) => v.viewCount);
+  const shortsNonSponsoredViews = shorts
+    .filter((v) => !sponsoredVideoIds.has(v.videoId))
+    .map((v) => v.viewCount);
+
+  const longformBaseline =
+    longformNonSponsoredViews.length > 0
+      ? median(longformNonSponsoredViews)
+      : median(longform.map((v) => v.viewCount));
+  const shortsBaseline =
+    shortsNonSponsoredViews.length > 0
+      ? median(shortsNonSponsoredViews)
+      : median(shorts.map((v) => v.viewCount));
+
+  // ---------- Step 5: group by canonical brand ----------------------------
+  type BrandGroup = {
+    canonical: string;
+    integrations: {
+      video: DetailedVideo;
+      sponsored: boolean;
+      affiliate: boolean;
+      format: "longform" | "shorts";
+    }[];
+  };
+  const byBrand = new Map<string, BrandGroup>();
+
+  for (const a of annotated) {
+    if (!(a.sponsored || a.affiliate)) continue;
+    if (a.brands.length === 0) continue;
+
+    const format: "longform" | "shorts" =
+      a.video.durationSeconds > 0 && a.video.durationSeconds <= SHORTS_THRESHOLD_SECONDS
+        ? "shorts"
+        : "longform";
+
+    // Dedupe brands within a single video (same canonical mentioned twice).
+    const seenInVideo = new Set<string>();
+    for (const rawBrand of a.brands) {
+      const canon = canonical(rawBrand);
+      if (seenInVideo.has(canon)) continue;
+      seenInVideo.add(canon);
+
+      const key = normalizeBrandKey(canon);
+      const existing = byBrand.get(key);
+      const entry = { video: a.video, sponsored: a.sponsored, affiliate: a.affiliate, format };
+      if (existing) {
+        existing.integrations.push(entry);
+      } else {
+        byBrand.set(key, { canonical: canon, integrations: [entry] });
+      }
+    }
+  }
+
+  // ---------- Step 6: all-time recurrence scan ----------------------------
+  const passB = await passBPromise;
+
+  type Recurrence = {
+    totalAppearancesAllTime: number;
+    firstSeenAt: string;
+    lastSeenAt: string;
+  };
+
+  function scanRecurrence(brandCanonical: string): Recurrence {
+    if (brandCanonical === "Unknown") {
+      // We can't substring-search for "Unknown" — fall back to Pass A counts.
+      return { totalAppearancesAllTime: 0, firstSeenAt: "", lastSeenAt: "" };
+    }
+    const rx = brandMentionRegex(brandCanonical);
+    const matches: string[] = []; // publishedAt of each match
+    for (const v of passB) {
+      const haystack = `${v.title}\n${v.description}`;
+      if (rx.test(haystack)) matches.push(v.publishedAt);
+    }
+    if (matches.length === 0) {
+      return { totalAppearancesAllTime: 0, firstSeenAt: "", lastSeenAt: "" };
+    }
+    const sorted = matches.sort();
+    return {
+      totalAppearancesAllTime: matches.length,
+      firstSeenAt: sorted[0],
+      lastSeenAt: sorted[sorted.length - 1],
     };
   }
 
-  // 3) Group by brand (case-insensitive). Pick the most-viewed video per brand
-  //    for the sentiment probe.
-  type BrandGroup = {
-    displayName: string;
-    videos: DetailedVideo[];
-  };
-  const byBrand = new Map<string, BrandGroup>();
-  for (const s of sponsoredVideos) {
-    const key = brandKey(s.brand);
-    if (!key) continue;
-    const existing = byBrand.get(key);
-    if (existing) {
-      existing.videos.push(s.video);
-    } else {
-      byBrand.set(key, { displayName: s.brand, videos: [s.video] });
-    }
-  }
+  // ---------- Step 8: sentiment per brand ---------------------------------
+  const groups = [...byBrand.values()];
 
-  const brandList = [...byBrand.values()];
-
-  // 4) Sentiment per brand (Haiku × M, bounded concurrency). Fetch comments
-  //    from the brand's most-viewed sponsored video.
   const sentiments = await pMap(
-    brandList,
-    async (group) => {
-      const topVideo = [...group.videos].sort((a, b) => b.viewCount - a.viewCount)[0];
+    groups,
+    async (g) => {
+      // Skip sentiment for Unknown — no real signal to extract.
+      if (g.canonical === "Unknown") return null;
+      const topVideo = [...g.integrations].sort(
+        (a, b) => b.video.viewCount - a.video.viewCount,
+      )[0].video;
       const comments = await getVideoComments(topVideo.videoId, SENTIMENT_COMMENT_COUNT);
-      return analyzeSentiment(group.displayName, comments);
+      return analyzeSentiment(g.canonical, comments);
     },
     SENTIMENT_CONCURRENCY,
   );
 
-  // 5) Score every brand and assemble.
-  const sponsors: SponsorEntry[] = brandList.map((group, i) => {
-    const sorted = [...group.videos].sort((a, b) => b.viewCount - a.viewCount);
-    const top = sorted[0];
-    const avgViews =
-      group.videos.reduce((s, v) => s + v.viewCount, 0) / group.videos.length;
-    const ratio = baseline > 0 ? avgViews / baseline : 0;
-    const integrationCount = group.videos.length;
-    const recurrence = integrationCount >= 2;
+  // ---------- Steps 5/6/7/9 assembly --------------------------------------
+  const cards: SponsorScorecard[] = groups.map((g, i) => {
+    // Recent (Pass A) integration data
+    const recentIntegrations = g.integrations;
+    const integrationsRecent = recentIntegrations.length;
+    const videoIdsRecent = recentIntegrations.map((x) => x.video.videoId);
+
+    // Content format
+    const hasLong = recentIntegrations.some((x) => x.format === "longform");
+    const hasShort = recentIntegrations.some((x) => x.format === "shorts");
+    const contentType: ContentType =
+      hasLong && hasShort ? "both" : hasLong ? "longform" : "shorts";
+
+    // Views vs baseline (format-aware)
+    const ratios = recentIntegrations
+      .map((x) => {
+        const baseline = x.format === "shorts" ? shortsBaseline : longformBaseline;
+        return baseline > 0 ? x.video.viewCount / baseline : 0;
+      })
+      .filter((r) => Number.isFinite(r) && r > 0);
+    const avgViewsVsBaseline =
+      ratios.length > 0 ? Number((ratios.reduce((s, r) => s + r, 0) / ratios.length).toFixed(2)) : 0;
+
+    // All-sponsored-by-affiliate-only? Then the brand is "affiliate".
+    const affiliateOnly =
+      recentIntegrations.every((x) => x.affiliate && !x.sponsored) &&
+      recentIntegrations.length > 0;
+
+    // Recurrence (Pass B)
+    const rec = scanRecurrence(g.canonical);
+    // The most recent appearance is at least Pass-A's newest integration; merge
+    // with Pass B's last-seen so freshness reflects whichever is fresher.
+    const passALast = [...recentIntegrations]
+      .map((x) => x.video.publishedAt)
+      .sort()
+      .reverse()[0];
+    const lastSeenAt =
+      [rec.lastSeenAt, passALast].filter(Boolean).sort().reverse()[0] ?? "";
+    const firstSeenAt =
+      [rec.firstSeenAt, passALast].filter(Boolean).sort()[0] ?? "";
+    const totalAppearancesAllTime =
+      g.canonical === "Unknown"
+        ? integrationsRecent
+        : Math.max(rec.totalAppearancesAllTime, integrationsRecent);
+
+    const freshness = lastSeenAt ? freshnessFor(lastSeenAt) : "Dormant";
+
+    // Sentiment
     const s = sentiments[i];
-    const signal = tier(ratio, s.sentiment, recurrence);
+    const sentiment: SponsorSentiment | null = s?.sentiment ?? null;
+    const sentimentEvidence = s?.evidence ?? null;
+
+    // Composite signal
+    const signal: SponsorSignal =
+      g.canonical === "Unknown"
+        ? "Mixed" // Unknown rows aren't surfaced in the main table anyway
+        : tier(avgViewsVsBaseline, sentiment, totalAppearancesAllTime);
+
     return {
-      brand: group.displayName,
-      integrationCount,
-      videoIds: group.videos.map((v) => v.videoId),
-      topVideoId: top.videoId,
-      avgViewsVsBaseline: Number(ratio.toFixed(2)),
-      sentiment: s.sentiment,
-      sentimentEvidence: s.evidence,
-      recurrence,
+      brand: g.canonical,
+      contentType,
+      integrationsRecent,
+      videoIdsRecent,
+      totalAppearancesAllTime,
+      firstSeenAt,
+      lastSeenAt,
+      freshness,
+      avgViewsVsBaseline,
+      sentiment,
+      sentimentEvidence,
+      returnedAfterFirst: totalAppearancesAllTime > 1,
+      affiliate: affiliateOnly,
       signal,
-    } satisfies SponsorEntry;
+    } satisfies SponsorScorecard;
   });
 
-  sponsors.sort((a, b) => {
+  // Sort: signal (Strong first), then lastSeenAt desc.
+  cards.sort((a, b) => {
     const tierDiff = TIER_RANK[a.signal] - TIER_RANK[b.signal];
     if (tierDiff !== 0) return tierDiff;
-    if (b.integrationCount !== a.integrationCount) return b.integrationCount - a.integrationCount;
-    return b.avgViewsVsBaseline - a.avgViewsVsBaseline;
+    return Date.parse(b.lastSeenAt || "0") - Date.parse(a.lastSeenAt || "0");
   });
 
   console.log(
-    `[sponsors] channelId=${channelId} done in ${Date.now() - overallStart}ms — ` +
-      `videos=${inWindowDetailed.length} sponsored=${sponsoredVideos.length} brands=${sponsors.length} ` +
-      `baseline=${baseline.toLocaleString("en-US")}`,
+    `[sponsors] v2 channelId=${channelId} done in ${Date.now() - overallStart}ms — ` +
+      `passA=${passA.length} sponsoredBrands=${cards.length} ` +
+      `longformBaseline=${longformBaseline.toLocaleString("en-US")} ` +
+      `shortsBaseline=${shortsBaseline.toLocaleString("en-US")}`,
   );
 
-  return {
-    windowDays: WINDOW_DAYS,
-    totalVideosInWindow: inWindowDetailed.length,
-    baselineMedianViews: baseline,
-    sponsoredVideoCount: sponsoredVideos.length,
-    sponsors,
-  };
-}
-
-function emptyScorecard(): SponsorScorecard {
-  return {
-    windowDays: WINDOW_DAYS,
-    totalVideosInWindow: 0,
-    baselineMedianViews: 0,
-    sponsoredVideoCount: 0,
-    sponsors: [],
-  };
+  return cards;
 }
 
 // ---------------------------------------------------------------------------
-// Summary string used by the Concept Seed prompt.
+// Summary string consumed by the Concept Seed prompt.
 // ---------------------------------------------------------------------------
 
-export function buildScorecardSummary(scorecard: SponsorScorecard): string {
-  if (scorecard.sponsors.length === 0) {
-    return "No paid brand integrations detected in the last 6 months.";
+export function buildScorecardSummary(cards: SponsorScorecard[]): string {
+  if (cards.length === 0) {
+    return "No paid brand integrations detected in the last 18 months.";
   }
   const lines: string[] = [];
-  lines.push(
-    `Window: last ${scorecard.windowDays} days. Baseline (median non-sponsored views): ${scorecard.baselineMedianViews.toLocaleString(
-      "en-US",
-    )}.`,
-  );
-  for (const s of scorecard.sponsors) {
-    const ratio = `${s.avgViewsVsBaseline.toFixed(2)}× baseline`;
-    const recur = s.recurrence ? `${s.integrationCount}x integrations` : "1 integration";
+  for (const c of cards) {
+    if (c.brand === "Unknown") continue;
+    const ratio = `${c.avgViewsVsBaseline.toFixed(2)}× baseline`;
+    const monthsSpan = monthsBetween(c.firstSeenAt, c.lastSeenAt);
+    const partnership =
+      c.totalAppearancesAllTime >= 3 && monthsSpan >= 12 ? " · long-term partner" : "";
+    const sentimentBit = c.sentiment ? ` · sentiment ${c.sentiment}` : "";
+    const relationship = c.affiliate ? "affiliate-only" : "sponsored";
     lines.push(
-      `- ${s.brand} — ${s.signal} · ${ratio} · ${recur} · sentiment ${s.sentiment} (${s.sentimentEvidence})`,
+      `- ${c.brand} — ${c.signal} · ${c.freshness} · ${c.contentType} · ${relationship} · ` +
+        `${ratio} · ${c.integrationsRecent}× recent / ${c.totalAppearancesAllTime}× all-time${partnership}${sentimentBit}`,
     );
   }
+  if (lines.length === 0) {
+    return "Only unidentified paid placements detected — no named sponsors usable for guidance.";
+  }
   return lines.join("\n");
+}
+
+function monthsBetween(firstIso: string, lastIso: string): number {
+  const a = Date.parse(firstIso);
+  const b = Date.parse(lastIso);
+  if (Number.isNaN(a) || Number.isNaN(b) || b < a) return 0;
+  return Math.round((b - a) / (30 * 24 * 60 * 60 * 1000));
 }

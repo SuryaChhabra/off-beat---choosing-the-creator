@@ -200,7 +200,23 @@ export type DetailedVideo = {
   description: string;
   publishedAt: string;
   viewCount: number;
+  durationSeconds: number;
+  paidProductPlacement: boolean;
 };
+
+export type LightVideo = {
+  videoId: string;
+  title: string;
+  description: string;
+  publishedAt: string;
+};
+
+export function parseIsoDurationToSeconds(iso: string): number {
+  if (!iso) return 0;
+  const m = iso.match(/^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$/);
+  if (!m) return 0;
+  return Number(m[1] ?? 0) * 3600 + Number(m[2] ?? 0) * 60 + Number(m[3] ?? 0);
+}
 
 export async function getUploadsPlaylistId(channelId: string): Promise<string | null> {
   const yt = getClient();
@@ -270,21 +286,75 @@ export async function getVideoDetails(videoIds: string[]): Promise<DetailedVideo
     for (let i = 0; i < videoIds.length; i += 50) {
       const chunk = videoIds.slice(i, i + 50);
       const res = await yt.videos.list({
-        part: ["snippet", "statistics"],
+        part: ["snippet", "statistics", "contentDetails", "paidProductPlacementDetails"],
         id: chunk,
       });
       for (const item of res.data.items ?? []) {
+        const duration = item.contentDetails?.duration ?? "";
         results.push({
           videoId: item.id ?? "",
           title: item.snippet?.title ?? "",
           description: item.snippet?.description ?? "",
           publishedAt: item.snippet?.publishedAt ?? "",
           viewCount: Number(item.statistics?.viewCount ?? 0),
+          durationSeconds: parseIsoDurationToSeconds(duration),
+          paidProductPlacement: Boolean(item.paidProductPlacementDetails?.hasPaidProductPlacement),
         });
       }
     }
     console.log(
       `[YouTube] getVideoDetails returned ${results.length}/${videoIds.length} in ${Date.now() - startedAt}ms`,
+    );
+    return results;
+  } catch (err) {
+    if (isQuotaExceeded(err)) throw new Error("YouTube API quota exceeded for the day");
+    throw err;
+  }
+}
+
+// Pass-B fetch: paginate the entire uploads playlist with snippet only.
+// No videos.list / Haiku calls — pure text capture used for the all-time
+// recurrence scan in the sponsor scorecard. Caller passes a generous max
+// (e.g. 5000) to grab everything the channel has uploaded.
+export async function getAllPlaylistVideosLight(
+  playlistId: string,
+  max: number = 5000,
+): Promise<LightVideo[]> {
+  const yt = getClient();
+  const startedAt = Date.now();
+  const results: LightVideo[] = [];
+  let pageToken: string | undefined = undefined;
+  let pages = 0;
+
+  try {
+    while (results.length < max) {
+      const remaining = max - results.length;
+      const pageSize = Math.min(50, remaining);
+      const res: youtube_v3.Schema$PlaylistItemListResponse = (
+        await yt.playlistItems.list({
+          part: ["snippet"],
+          playlistId,
+          maxResults: pageSize,
+          pageToken,
+        })
+      ).data;
+      pages++;
+      for (const item of res.items ?? []) {
+        const vid = item.snippet?.resourceId?.videoId ?? "";
+        if (!vid) continue;
+        results.push({
+          videoId: vid,
+          title: item.snippet?.title ?? "",
+          description: item.snippet?.description ?? "",
+          publishedAt: item.snippet?.publishedAt ?? "",
+        });
+      }
+      pageToken = res.nextPageToken ?? undefined;
+      if (!pageToken) break;
+    }
+    console.log(
+      `[YouTube] getAllPlaylistVideosLight playlist=${playlistId} returned ${results.length} ` +
+        `across ${pages} pages in ${Date.now() - startedAt}ms`,
     );
     return results;
   } catch (err) {

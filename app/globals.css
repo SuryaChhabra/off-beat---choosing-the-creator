@@ -627,6 +627,104 @@ input:focus {
   border: 0.5px solid var(--fg-faint);
 }
 
+/* Format badge ------------------------------------------------------------ */
+
+.scorecard-format {
+  display: inline-block;
+  padding: 3px 9px;
+  border-radius: 4px;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  border: 0.5px solid var(--border);
+  background: var(--bg-elev);
+  color: var(--fg-dim);
+  white-space: nowrap;
+}
+
+.scorecard-format.is-shorts {
+  color: var(--fg);
+  border-color: var(--border);
+}
+
+.scorecard-format.is-both {
+  color: var(--pink);
+  border-color: rgba(255, 45, 143, 0.45);
+}
+
+.scorecard-relationship {
+  font-size: 13px;
+  color: var(--fg-muted);
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+}
+
+/* Freshness pip ----------------------------------------------------------- */
+
+.scorecard-freshness {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 12px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--fg-dim);
+  white-space: nowrap;
+}
+
+.scorecard-freshness-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: var(--fg-faint);
+  flex-shrink: 0;
+}
+
+.scorecard-freshness.is-active {
+  color: #4ade80;
+}
+.scorecard-freshness.is-active .scorecard-freshness-dot {
+  background: #4ade80;
+}
+
+.scorecard-freshness.is-recent {
+  color: var(--fg);
+}
+.scorecard-freshness.is-recent .scorecard-freshness-dot {
+  background: var(--fg);
+}
+
+.scorecard-freshness.is-dormant {
+  color: var(--fg-faint);
+}
+.scorecard-freshness.is-dormant .scorecard-freshness-dot {
+  background: var(--fg-faint);
+}
+
+/* Subsections (Affiliate, Unidentified) ----------------------------------- */
+
+.scorecard-subsection {
+  margin-top: 2.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+}
+
+.scorecard-subhead {
+  font-size: 12px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--fg-muted);
+  margin: 0;
+}
+
+.scorecard-unknown-note {
+  font-size: 14px;
+  color: var(--fg-muted);
+  margin: 0;
+  line-height: 1.55;
+}
+
 /* Discuss button on concept card ------------------------------------------ */
 
 .results-concept-discuss {

@@ -38,8 +38,9 @@ export async function GET(_req: Request, { params }: { params: RouteParams }) {
       return Response.json({ error: `No channel matched "${decoded}"` }, { status: 404 });
     }
 
+    // v2 = 18-month deep + all-time recurrence + format-aware baselines.
     const scorecard = await cached(
-      `sponsors:v1:${channel.channelId}`,
+      `sponsors:v2:${channel.channelId}`,
       DAY_MS,
       () => getSponsorScorecard(channel.channelId),
     );
